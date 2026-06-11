@@ -1,0 +1,54 @@
+# Local configuration and secrets
+config.toml
+config.json
+*.env
+.env
+*.local.toml
+*.local.json
+
+# Runtime data
+/memory/
+/data/
+/logs/
+/workspace/
+/plugins/
+/rss/
+/locks/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.pytest_artifacts/
+
+# IDE / local assistant state
+.idea/
+.vscode/
+.claude/
+.codex
+CLAUDE.md
+AGENTS.md
+.squad/
+
+# Private or generated artifacts
+/private_runtime/
+/private_tests/
+/mcp_servers
+/.gitmodules
+*.docx
+*.pptx
+*.xlsx
+memory_quality_results/
+render_*/
+
+# OS
+Thumbs.db
+.DS_Store
