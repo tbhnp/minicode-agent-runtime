@@ -5,6 +5,7 @@ from pathlib import Path
 
 from agent.tool_hooks.base import ToolHook
 from agent.tool_hooks.types import HookContext, HookOutcome
+from core.observe.prom import observe_tool_denied
 
 
 class ToolRiskGuardHook(ToolHook):
@@ -29,6 +30,7 @@ class ToolRiskGuardHook(ToolHook):
         risk = (ctx.request.tool_risk or "read-only").strip() or "read-only"
         if risk in self._allowed_risks:
             return HookOutcome(reason=f"risk allowed: {risk}")
+        observe_tool_denied(risk)
         return HookOutcome(
             decision="deny",
             reason=f"{self._message_prefix}: {risk}",

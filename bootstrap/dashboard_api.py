@@ -8,16 +8,31 @@ import threading
 from datetime import timedelta
 from typing import Any
 
-import uvicorn
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+import asyncio
+import time
 
+import prometheus_client
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile, File
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from pydantic import BaseModel
+import uvicorn
+
+from core.observe.prom import (
+    HTTP_REQUESTS_TOTAL,
+    HTTP_REQUEST_DURATION,
+    MEMORY_ITEMS_TOTAL,
+    PROACTIVE_DELIVERIES_TOTAL,
+    SESSIONS_TOTAL,
+)
+from core.observe.stream_hub import get_stream_hub
 from proactive_v2.state import ProactiveStateStore
 from core.common.timekit import utcnow
 from session.store import SessionStore
 from memory2.store import MemoryStore2
+from agent.rag.runtime import get_rag_pipeline
+from agent.rag.types import RagDoc
 
 
 class SessionUpdatePayload(BaseModel):
@@ -59,6 +74,32 @@ class MemoryBatchDeletePayload(BaseModel):
 class ProactiveDeletePayload(BaseModel):
     source_key: str | None = None
     item_ids: list[str] | None = None
+
+
+class RagDocumentPayload(BaseModel):
+    id: str
+    text: str
+    meta: dict[str, Any] | None = None
+
+
+class RagIngestPayload(BaseModel):
+    documents: list[RagDocumentPayload]
+
+
+class RagChunkOut(BaseModel):
+    chunk_id: str
+    doc_id: str
+    text: str
+    vector_score: float = 0.0
+    bm25_score: float = 0.0
+    fused_score: float = 0.0
+    rerank_score: float | None = None
+
+
+class RagQueryResponse(BaseModel):
+    query: str
+    chunks: list[RagChunkOut]
+    context: str
 
 
 class ProactiveDashboardReader:
@@ -466,9 +507,186 @@ def create_dashboard_app(workspace: Path) -> FastAPI:
     app = FastAPI(title="Akashic Dashboard API", lifespan=lifespan)
     app.mount("/assets", StaticFiles(directory=static_dir), name="dashboard-assets")
 
+    @app.middleware("http")
+    async def _metrics_middleware(request: Request, call_next):
+        if request.url.path in ("/metrics",):
+            return await call_next(request)
+        method = request.method
+        path = request.url.path
+        started = time.perf_counter()
+        response = await call_next(request)
+        duration = time.perf_counter() - started
+        HTTP_REQUESTS_TOTAL.labels(
+            method=method, endpoint=path, status=response.status_code
+        ).inc()
+        HTTP_REQUEST_DURATION.labels(method=method, endpoint=path).observe(duration)
+        return response
+
     @app.get("/")
     def dashboard_index() -> FileResponse:
         return FileResponse(static_dir / "index.html")
+
+    @app.get("/metrics")
+    def metrics_endpoint() -> Response:
+        # 拉取时刷新运行时 gauge，避免后台轮询线程。
+        try:
+            _, active_total = memory_store.list_items_for_dashboard(
+                status="active", page=1, page_size=1
+            )
+            MEMORY_ITEMS_TOTAL.set(int(active_total or 0))
+        except Exception:
+            pass
+        try:
+            _, session_total = store.list_sessions_for_dashboard(page=1, page_size=1)
+            SESSIONS_TOTAL.set(int(session_total or 0))
+        except Exception:
+            pass
+        try:
+            PROACTIVE_DELIVERIES_TOTAL.set(
+                int(proactive_reader.get_overview()["counts"].get("deliveries", 0) or 0)
+            )
+        except Exception:
+            pass
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    @app.get("/api/stream/events")
+    async def stream_events(
+        request: Request,
+        session_key: str = Query(default=""),
+    ) -> StreamingResponse:
+        """SSE 实时推送 Agent trace 事件（思考流 / 工具调用 / RAG 检索 / 记忆写入）。
+
+        - 不传 session_key 或传 "*"：订阅全量事件；
+        - 传 session_key：仅订阅该会话事件；
+        - 客户端断开自动退订；无事件时每 15s 发 keep-alive 注释防止代理超时。
+        """
+        hub = get_stream_hub()
+        key = session_key or "*"
+
+        async def event_generator():
+            queue = hub.subscribe(key)
+            try:
+                yield ": connected\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+                        continue
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            finally:
+                hub.unsubscribe(queue, key)
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
+        )
+
+    @app.post("/api/rag/ingest")
+    async def rag_ingest(payload: RagIngestPayload) -> dict:
+        """批量入库文档：分块 → 嵌入 → 写入向量库 + BM25 索引。
+
+        未配置 embedding 环境变量时返回 501（RAG 未启用）。
+        """
+        pipe = get_rag_pipeline()
+        if pipe is None:
+            raise HTTPException(
+                status_code=501,
+                detail="RAG 未启用：请配置 RAG_EMBEDDING_BASE_URL / RAG_EMBEDDING_API_KEY 环境变量。",
+            )
+        docs = [RagDoc(id=d.id, text=d.text, meta=d.meta or {}) for d in payload.documents]
+        added = await pipe.ingest(docs)
+        return {"ingested": len(docs), "chunks": added}
+
+    @app.post("/api/rag/ingest/upload")
+    async def rag_ingest_upload(
+        files: list[UploadFile] = File(default=[]),
+    ) -> dict:
+        """多格式文档上传入库：支持 PDF / DOCX / Markdown / 纯文本。
+
+        未配置 embedding 环境变量时返回 501（RAG 未启用）。
+        """
+        pipe = get_rag_pipeline()
+        if pipe is None:
+            raise HTTPException(
+                status_code=501,
+                detail="RAG 未启用：请配置 RAG_EMBEDDING_BASE_URL / RAG_EMBEDDING_API_KEY 环境变量。",
+            )
+        if not files:
+            raise HTTPException(status_code=400, detail="未收到文件")
+
+        import tempfile
+
+        tmpdir = Path(tempfile.mkdtemp(prefix="ragup_"))
+        saved: list[Path] = []
+        rejected: list[str] = []
+        try:
+            for uf in files:
+                if not uf.filename:
+                    continue
+                suffix = Path(uf.filename).suffix.lower()
+                dest = tmpdir / f"{len(saved)}{suffix}"
+                try:
+                    content = await uf.read()
+                    dest.write_bytes(content)
+                    saved.append(dest)
+                except Exception as e:  # noqa: BLE001
+                    rejected.append(f"{uf.filename}: {e}")
+            if not saved:
+                raise HTTPException(status_code=400, detail="无有效文件可入库")
+            added = await pipe.ingest_files(saved)
+            return {
+                "files": len(saved),
+                "chunks": added,
+                "rejected": rejected,
+            }
+        finally:
+            for f in saved:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            try:
+                tmpdir.rmdir()
+            except OSError:
+                pass
+
+    @app.get("/api/rag/query")
+    async def rag_query(
+        q: str = Query(..., min_length=1),
+        top_k: int = Query(default=5, ge=1, le=20),
+    ) -> RagQueryResponse:
+        """混合检索（向量 + BM25，RRF 融合）+ 重排，返回 Top-K 片段与拼接上下文。
+
+        未配置 embedding 环境变量时返回 501（RAG 未启用）。
+        """
+        pipe = get_rag_pipeline()
+        if pipe is None:
+            raise HTTPException(
+                status_code=501,
+                detail="RAG 未启用：请配置 RAG_EMBEDDING_BASE_URL / RAG_EMBEDDING_API_KEY 环境变量。",
+            )
+        result = await pipe.query(q, top_k=top_k)
+        chunks = [
+            RagChunkOut(
+                chunk_id=c.chunk_id,
+                doc_id=c.doc_id,
+                text=c.text,
+                vector_score=c.vector_score,
+                bm25_score=c.bm25_score,
+                fused_score=c.fused_score,
+                rerank_score=c.rerank_score,
+            )
+            for c in result.chunks
+        ]
+        return RagQueryResponse(query=result.query, chunks=chunks, context=result.context)
 
     @app.get("/api/dashboard/sessions")
     def list_sessions(

@@ -20,6 +20,8 @@ from core.net.http import (
     configure_default_shared_http_resources,
 )
 from core.observe.writer import TraceWriter
+from core.observe.streaming_writer import StreamingObserveWriter
+from core.observe.stream_hub import get_stream_hub
 from core.observe.retention import run_retention_if_needed
 
 logging.basicConfig(
@@ -77,7 +79,7 @@ class AppRuntime:
         self.proactive_loop = None
         self.peer_process_manager = None
         self.peer_poller = None
-        self.observe_writer: TraceWriter | None = None
+        self.observe_writer: "StreamingObserveWriter | TraceWriter | None" = None
         self.observe_task: asyncio.Task[None] | None = None
         self.dashboard_server = None
         self.dashboard_task: asyncio.Task[None] | None = None
@@ -92,7 +94,9 @@ class AppRuntime:
         try:
             # 初始化 observe writer
             observe_db_path = self.workspace / "observe" / "observe.db"
-            self.observe_writer = TraceWriter(observe_db_path)
+            self.observe_writer = StreamingObserveWriter(
+                TraceWriter(observe_db_path), get_stream_hub()
+            )
             asyncio.create_task(
                 run_retention_if_needed(observe_db_path), name="observe_retention"
             )

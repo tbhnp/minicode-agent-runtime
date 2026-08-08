@@ -49,6 +49,23 @@ AGENTS.md
 memory_quality_results/
 render_*/
 
+# Assistant working memory & local state
+/.workbuddy/
+
+# Resume / interview / job-hunt files (do not push)
+resume_*.md
+面试准备*.md
+eval_metric_ranges.md
+langsmith_vs_prometheus.md
+
+# Ad-hoc scratch benchmarks/tests (keep local)
+_bench_*.py
+_test_*.py
+
+# Eval run results (contain resume metrics — keep local)
+eval/agent_trace_results/selftest.json
+eval/agent_trace_results/
+
 # OS
 Thumbs.db
 .DS_Store

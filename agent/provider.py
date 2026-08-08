@@ -60,6 +60,8 @@ class LLMResponse:
     content: str | None
     tool_calls: list[ToolCall] = field(default_factory=list)
     thinking: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
 
 class LLMProvider:
@@ -138,7 +140,16 @@ class LLMProvider:
             if m:
                 thinking = m.group(1).strip()
                 raw = _THINK_RE.sub("", raw).strip() or None
-        return LLMResponse(content=raw, tool_calls=tool_calls, thinking=thinking)
+        usage = getattr(resp, "usage", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0) or None
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0) or None
+        return LLMResponse(
+            content=raw,
+            tool_calls=tool_calls,
+            thinking=thinking,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     async def _chat_streaming(
         self,
@@ -150,12 +161,15 @@ class LLMProvider:
         reasoning_parts: list[str] = []
         tool_call_chunks: dict[int, dict[str, str]] = {}
         tool_call_seen = False
+        stream_usage: Any = None
 
         async for chunk in stream:
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue
             choice = choices[0]
+            if getattr(chunk, "usage", None) is not None:
+                stream_usage = chunk.usage
             delta = getattr(choice, "delta", None)
             if delta is None:
                 continue
@@ -205,7 +219,15 @@ class LLMProvider:
             if m:
                 thinking = m.group(1).strip()
                 raw = _THINK_RE.sub("", raw).strip() or None
-        return LLMResponse(content=raw, tool_calls=tool_calls, thinking=thinking)
+        prompt_tokens = int(getattr(stream_usage, "prompt_tokens", 0) or 0) or None
+        completion_tokens = int(getattr(stream_usage, "completion_tokens", 0) or 0) or None
+        return LLMResponse(
+            content=raw,
+            tool_calls=tool_calls,
+            thinking=thinking,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     async def _create_with_retry(self, kwargs: dict) -> object:
         last_err: Exception | None = None
